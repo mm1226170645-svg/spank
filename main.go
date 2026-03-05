@@ -47,6 +47,7 @@ var (
 	haloMode     bool
 	customPath   string
 	customFiles  []string
+	fastMode     bool
 	minAmplitude float64
 	cooldownMs   int
 	stdioMode    bool
@@ -73,19 +74,50 @@ const (
 	// halves. Controls how fast escalation fades.
 	decayHalfLife = 30.0
 
+	// defaultMinAmplitude is the default detection threshold.
+	defaultMinAmplitude = 0.05
+
 	// defaultCooldownMs is the default cooldown between audio responses.
 	defaultCooldownMs = 750
 
-	// sensorPollInterval is how often we check for new accelerometer data.
-	sensorPollInterval = 10 * time.Millisecond
+	// defaultSensorPollInterval is how often we check for new accelerometer data.
+	defaultSensorPollInterval = 10 * time.Millisecond
 
-	// maxSampleBatch caps the number of accelerometer samples processed
+	// defaultMaxSampleBatch caps the number of accelerometer samples processed
 	// per tick to avoid falling behind.
-	maxSampleBatch = 200
+	defaultMaxSampleBatch = 200
 
 	// sensorStartupDelay gives the sensor time to start producing data.
 	sensorStartupDelay = 100 * time.Millisecond
 )
+
+type runtimeTuning struct {
+	minAmplitude float64
+	cooldown     time.Duration
+	pollInterval time.Duration
+	maxBatch     int
+}
+
+func defaultTuning() runtimeTuning {
+	return runtimeTuning{
+		minAmplitude: defaultMinAmplitude,
+		cooldown:     time.Duration(defaultCooldownMs) * time.Millisecond,
+		pollInterval: defaultSensorPollInterval,
+		maxBatch:     defaultMaxSampleBatch,
+	}
+}
+
+func applyFastOverlay(base runtimeTuning) runtimeTuning {
+	base.pollInterval = 4 * time.Millisecond
+	base.cooldown = 350 * time.Millisecond
+	if base.minAmplitude > 0.18 {
+		base.minAmplitude = 0.18
+	}
+	if base.maxBatch < 320 {
+		base.maxBatch = 320
+	}
+	return base
+}
 
 type soundPack struct {
 	name   string
@@ -197,7 +229,18 @@ within a minute, the more intense the sounds become.
 Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 		Version: version,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return run(cmd.Context())
+			tuning := defaultTuning()
+			if fastMode {
+				tuning = applyFastOverlay(tuning)
+			}
+			// Explicit flags override fast preset defaults
+			if cmd.Flags().Changed("min-amplitude") {
+				tuning.minAmplitude = minAmplitude
+			}
+			if cmd.Flags().Changed("cooldown") {
+				tuning.cooldown = time.Duration(cooldownMs) * time.Millisecond
+			}
+			return run(cmd.Context(), tuning)
 		},
 		SilenceUsage: true,
 	}
@@ -205,8 +248,9 @@ Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 	cmd.Flags().BoolVarP(&sexyMode, "sexy", "s", false, "Enable sexy mode")
 	cmd.Flags().BoolVarP(&haloMode, "halo", "H", false, "Enable halo mode")
 	cmd.Flags().StringVarP(&customPath, "custom", "c", "", "Path to custom MP3 audio directory")
+	cmd.Flags().BoolVar(&fastMode, "fast", false, "Enable faster detection tuning (shorter cooldown, higher sensitivity)")
 	cmd.Flags().StringSliceVar(&customFiles, "custom-files", nil, "Comma-separated list of custom MP3 files")
-	cmd.Flags().Float64Var(&minAmplitude, "min-amplitude", 0.05, "Minimum amplitude threshold (0.0-1.0, lower = more sensitive)")
+	cmd.Flags().Float64Var(&minAmplitude, "min-amplitude", defaultMinAmplitude, "Minimum amplitude threshold (0.0-1.0, lower = more sensitive)")
 	cmd.Flags().IntVar(&cooldownMs, "cooldown", defaultCooldownMs, "Cooldown between responses in milliseconds")
 	cmd.Flags().BoolVar(&stdioMode, "stdio", false, "Enable stdio mode: JSON output and stdin commands (for GUI integration)")
 
@@ -215,7 +259,7 @@ Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 	}
 }
 
-func run(ctx context.Context) error {
+func run(ctx context.Context, tuning runtimeTuning) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("spank requires root privileges for accelerometer access, run with: sudo spank")
 	}
@@ -234,8 +278,11 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("--sexy, --halo, and --custom/--custom-files are mutually exclusive; pick one")
 	}
 
-	if minAmplitude < 0 || minAmplitude > 1 {
+	if tuning.minAmplitude < 0 || tuning.minAmplitude > 1 {
 		return fmt.Errorf("--min-amplitude must be between 0.0 and 1.0")
+	}
+	if tuning.cooldown <= 0 {
+		return fmt.Errorf("--cooldown must be greater than 0")
 	}
 
 	var pack *soundPack
@@ -304,12 +351,11 @@ func run(ctx context.Context) error {
 	// Give the sensor a moment to start producing data.
 	time.Sleep(sensorStartupDelay)
 
-	cooldown := time.Duration(cooldownMs) * time.Millisecond
-	return listenForSlaps(ctx, pack, accelRing, cooldown)
+	return listenForSlaps(ctx, pack, accelRing, tuning)
 }
 
-func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuffer, cooldown time.Duration) error {
-	tracker := newSlapTracker(pack, cooldown)
+func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuffer, tuning runtimeTuning) error {
+	tracker := newSlapTracker(pack, tuning.cooldown)
 	speakerInit := false
 	det := detector.New()
 	var lastAccelTotal uint64
@@ -321,12 +367,16 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 		go readStdinCommands()
 	}
 
-	fmt.Printf("spank: listening for slaps in %s mode... (ctrl+c to quit)\n", pack.name)
+	presetLabel := "default"
+	if fastMode {
+		presetLabel = "fast"
+	}
+	fmt.Printf("spank: listening for slaps in %s mode with %s tuning... (ctrl+c to quit)\n", pack.name, presetLabel)
 	if stdioMode {
 		fmt.Println(`{"status":"ready"}`)
 	}
 
-	ticker := time.NewTicker(sensorPollInterval)
+	ticker := time.NewTicker(tuning.pollInterval)
 	defer ticker.Stop()
 
 	for {
@@ -352,8 +402,8 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 
 		samples, newTotal := accelRing.ReadNew(lastAccelTotal, shm.AccelScale)
 		lastAccelTotal = newTotal
-		if len(samples) > maxSampleBatch {
-			samples = samples[len(samples)-maxSampleBatch:]
+		if len(samples) > tuning.maxBatch {
+			samples = samples[len(samples)-tuning.maxBatch:]
 		}
 
 		nSamples := len(samples)
@@ -372,10 +422,10 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 		}
 		lastEventTime = ev.Time
 
-		if time.Since(lastYell) <= cooldown {
+		if time.Since(lastYell) <= tuning.cooldown {
 			continue
 		}
-		if ev.Amplitude < minAmplitude {
+		if ev.Amplitude < tuning.minAmplitude {
 			continue
 		}
 
