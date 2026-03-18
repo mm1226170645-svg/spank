@@ -8,8 +8,10 @@ import (
 )
 
 type micConfig struct {
-	threshold  float64
-	multiplier float64
+	threshold   float64
+	multiplier  float64
+	highpassHz  float64
+	noiseCancel bool
 }
 
 func listenForMicSlaps(ctx context.Context, pack *soundPack, tuning runtimeTuning, cfg micConfig) error {

@@ -14,8 +14,8 @@ import (
 	"math"
 	"math/rand"
 	"os"
-	"os/signal"
 	"os/exec"
+	"os/signal"
 	"regexp"
 	"sort"
 	"strings"
@@ -47,22 +47,24 @@ var sexyAudio embed.FS
 var haloAudio embed.FS
 
 var (
-	sexyMode     bool
-	haloMode     bool
-	customPath   string
-	customFiles  []string
-	fastMode     bool
-	keyboardMode bool
-	micMode      bool
-	minAmplitude float64
-	cooldownMs   int
-	stdioMode     bool
-	volumeScaling bool
-	paused        bool
-	pausedMu      sync.RWMutex
-	speedRatio    float64
-	micThreshold  float64
-	micMultiplier float64
+	sexyMode       bool
+	haloMode       bool
+	customPath     string
+	customFiles    []string
+	fastMode       bool
+	keyboardMode   bool
+	micMode        bool
+	minAmplitude   float64
+	cooldownMs     int
+	stdioMode      bool
+	volumeScaling  bool
+	paused         bool
+	pausedMu       sync.RWMutex
+	speedRatio     float64
+	micThreshold   float64
+	micMultiplier  float64
+	micHighpassHz  float64
+	micNoiseCancel bool
 )
 
 // sensorReady is closed once shared memory is created and the sensor
@@ -108,6 +110,9 @@ const (
 
 	// defaultMicMultiplier is the adaptive threshold multiplier for mic mode.
 	defaultMicMultiplier = 3.0
+
+	// defaultMicHighpassHz is the high-pass cutoff to emphasize tap transients.
+	defaultMicHighpassHz = 180.0
 )
 
 type runtimeTuning struct {
@@ -226,7 +231,7 @@ func (st *slapTracker) getFile(score float64) string {
 	// At sustained max slap rate, score reaches ssMax which maps
 	// to the final file.
 	maxIdx := len(st.pack.files) - 1
-	idx := min(int(float64(len(st.pack.files)) * (1.0 - math.Exp(-(score-1)/st.scale))), maxIdx)
+	idx := min(int(float64(len(st.pack.files))*(1.0-math.Exp(-(score-1)/st.scale))), maxIdx)
 	return st.pack.files[idx]
 }
 
@@ -275,6 +280,8 @@ Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 	cmd.Flags().Float64Var(&speedRatio, "speed", defaultSpeedRatio, "Playback speed multiplier (0.5 = half speed, 2.0 = double speed)")
 	cmd.Flags().Float64Var(&micThreshold, "mic-threshold", defaultMicThreshold, "Mic mode RMS threshold (higher = less sensitive)")
 	cmd.Flags().Float64Var(&micMultiplier, "mic-multiplier", defaultMicMultiplier, "Mic mode adaptive threshold multiplier (higher = less sensitive)")
+	cmd.Flags().Float64Var(&micHighpassHz, "mic-highpass", defaultMicHighpassHz, "Mic mode high-pass cutoff in Hz (higher = ignore low rumble)")
+	cmd.Flags().BoolVar(&micNoiseCancel, "mic-noise-cancel", true, "Mic mode noise cancellation (focus on sharp tap transients)")
 
 	if err := fang.Execute(context.Background(), cmd); err != nil {
 		os.Exit(1)
@@ -315,6 +322,9 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 		}
 		if micMultiplier <= 0 {
 			return fmt.Errorf("--mic-multiplier must be greater than 0")
+		}
+		if micHighpassHz <= 0 {
+			return fmt.Errorf("--mic-highpass must be greater than 0")
 		}
 	}
 
@@ -364,8 +374,10 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 
 	if micMode {
 		return listenForMicSlaps(ctx, pack, tuning, micConfig{
-			threshold:  micThreshold,
-			multiplier: micMultiplier,
+			threshold:   micThreshold,
+			multiplier:  micMultiplier,
+			highpassHz:  micHighpassHz,
+			noiseCancel: micNoiseCancel,
 		})
 	}
 
@@ -604,10 +616,10 @@ var speakerMu sync.Mutex
 // (base 2): -3.0 is ~1/8 volume, 0.0 is full volume.
 func amplitudeToVolume(amplitude float64) float64 {
 	const (
-		minAmp   = 0.05  // softest detectable
-		maxAmp   = 0.80  // treat anything above this as max
-		minVol   = -3.0  // quietest playback (1/8 volume with base 2)
-		maxVol   = 0.0   // full volume
+		minAmp = 0.05 // softest detectable
+		maxAmp = 0.80 // treat anything above this as max
+		minVol = -3.0 // quietest playback (1/8 volume with base 2)
+		maxVol = 0.0  // full volume
 	)
 
 	// Clamp

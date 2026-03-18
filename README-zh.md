@@ -80,6 +80,10 @@ spank --mic
 # 麦克风灵敏度调节（数值越高越不敏感）
 spank --mic --mic-threshold 0.03
 spank --mic --mic-multiplier 4.0
+
+# 麦克风噪声抑制（默认开启）
+spank --mic --mic-noise-cancel
+spank --mic --mic-noise-cancel --mic-highpass 220
 ```
 
 ### 模式

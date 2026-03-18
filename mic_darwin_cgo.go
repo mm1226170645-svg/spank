@@ -15,8 +15,10 @@ import (
 )
 
 type micConfig struct {
-	threshold  float64
-	multiplier float64
+	threshold   float64
+	multiplier  float64
+	highpassHz  float64
+	noiseCancel bool
 }
 
 type micEvent struct {
@@ -30,6 +32,9 @@ func listenForMicSlaps(ctx context.Context, pack *soundPack, tuning runtimeTunin
 	}
 	if cfg.multiplier <= 0 {
 		cfg.multiplier = defaultMicMultiplier
+	}
+	if cfg.highpassHz <= 0 {
+		cfg.highpassHz = defaultMicHighpassHz
 	}
 
 	malgoCtx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
@@ -52,6 +57,12 @@ func listenForMicSlaps(ctx context.Context, pack *soundPack, tuning runtimeTunin
 	var lastTrigger time.Time
 	noiseEMA := cfg.threshold
 	const noiseAlpha = 0.01
+	fs := float64(deviceConfig.SampleRate)
+	dt := 1.0 / fs
+	rc := 1.0 / (2.0 * math.Pi * cfg.highpassHz)
+	alpha := rc / (rc + dt)
+	var hpPrev float64
+	var xPrev float64
 
 	onRecvFrames := func(_ []byte, input []byte, framecount uint32) {
 		if len(input) == 0 {
@@ -63,17 +74,30 @@ func listenForMicSlaps(ctx context.Context, pack *soundPack, tuning runtimeTunin
 		}
 
 		var sum float64
+		var hpSum float64
 		if len(input) >= int(sampleCount*sizeInBytes) {
 			samples := unsafe.Slice((*int16)(unsafe.Pointer(&input[0])), sampleCount)
 			for _, v := range samples {
 				fv := float64(v) / 32768.0
 				sum += fv * fv
+				if cfg.noiseCancel {
+					hp := alpha * (hpPrev + fv - xPrev)
+					hpPrev = hp
+					xPrev = fv
+					hpSum += hp * hp
+				}
 			}
 		} else {
 			for i := 0; i+1 < len(input); i += 2 {
 				v := int16(binary.LittleEndian.Uint16(input[i : i+2]))
 				fv := float64(v) / 32768.0
 				sum += fv * fv
+				if cfg.noiseCancel {
+					hp := alpha * (hpPrev + fv - xPrev)
+					hpPrev = hp
+					xPrev = fv
+					hpSum += hp * hp
+				}
 			}
 			sampleCount = uint32(len(input) / 2)
 			if sampleCount == 0 {
@@ -82,20 +106,24 @@ func listenForMicSlaps(ctx context.Context, pack *soundPack, tuning runtimeTunin
 		}
 
 		rms := math.Sqrt(sum / float64(sampleCount))
+		energy := rms
+		if cfg.noiseCancel {
+			energy = math.Sqrt(hpSum / float64(sampleCount))
+		}
 		threshold := math.Max(cfg.threshold, noiseEMA*cfg.multiplier)
 
 		now := time.Now()
-		if rms > threshold && now.Sub(lastTrigger) > tuning.cooldown {
+		if energy > threshold && now.Sub(lastTrigger) > tuning.cooldown {
 			lastTrigger = now
 			select {
-			case events <- micEvent{rms: rms, at: now}:
+			case events <- micEvent{rms: energy, at: now}:
 			default:
 			}
 			return
 		}
 
-		if rms < threshold {
-			noiseEMA = (1-noiseAlpha)*noiseEMA + noiseAlpha*rms
+		if energy < threshold {
+			noiseEMA = (1-noiseAlpha)*noiseEMA + noiseAlpha*energy
 		}
 	}
 

@@ -80,6 +80,10 @@ spank --mic
 # Mic tuning (higher = less sensitive)
 spank --mic --mic-threshold 0.03
 spank --mic --mic-multiplier 4.0
+
+# Mic noise cancellation (enabled by default)
+spank --mic --mic-noise-cancel
+spank --mic --mic-noise-cancel --mic-highpass 220
 ```
 
 ### Modes
