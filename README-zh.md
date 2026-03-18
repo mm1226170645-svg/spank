@@ -14,12 +14,13 @@
 
 > "巅峰工程" — [@tylertaewook](https://x.com/tylertaewook)
 
-使用 Apple Silicon 芯片的加速度传感器，检测笔记本电脑的物理撞击并播放音频回应。单个二进制文件，无依赖。
+使用 Apple Silicon 芯片的加速度传感器，检测笔记本电脑的物理撞击并播放音频回应。单个二进制文件，无依赖。对于缺少 SPU 加速度传感器的 M1 机型，会自动回退到键盘触发模式。
 
 ## 系统要求
 
-- macOS  M2+芯片
-- `sudo`（用于访问加速度传感器）
+- macOS  M2+ 芯片（加速度传感器检测；M1 使用键盘回退模式）
+- `sudo`（用于访问加速度传感器；`--keyboard` 或 `--mic` 不需要）
+- 麦克风模式（`--mic`）需要授予麦克风权限，并启用 CGO 构建
 - Go 1.26+（如果从源代码构建）
 
 ## 安装
@@ -69,6 +70,16 @@ sudo spank --cooldown 600
 sudo spank --speed 0.7   # 更慢更深沉
 sudo spank --speed 1.5   # 更快
 sudo spank --sexy --speed 0.6
+
+# 键盘模式 — 任意按键触发声音（M1 可用）
+spank --keyboard
+
+# 麦克风模式 — 通过麦克风捕捉敲击声触发（M1 可用）
+spank --mic
+
+# 麦克风灵敏度调节（数值越高越不敏感）
+spank --mic --mic-threshold 0.03
+spank --mic --mic-multiplier 4.0
 ```
 
 ### 模式

@@ -7,6 +7,7 @@ require (
 	github.com/gopxl/beep/v2 v2.1.1
 	github.com/spf13/cobra v1.10.2
 	github.com/taigrr/apple-silicon-accelerometer v0.1.0
+	golang.org/x/term v0.17.0
 )
 
 require (
@@ -22,6 +23,7 @@ require (
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/ebitengine/oto/v3 v3.4.0 // indirect
 	github.com/ebitengine/purego v0.10.0 // indirect
+	github.com/gen2brain/malgo v0.11.24 // indirect
 	github.com/hajimehoshi/go-mp3 v0.3.4 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect

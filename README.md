@@ -14,12 +14,13 @@ Slap your MacBook, it yells back.
 
 > "peak engineering" — [@tylertaewook](https://x.com/tylertaewook)
 
-Uses the Apple Silicon accelerometer (Bosch BMI286 IMU via IOKit HID) to detect physical hits on your laptop and plays audio responses. Single binary, no dependencies.
+Uses the Apple Silicon accelerometer (Bosch BMI286 IMU via IOKit HID) to detect physical hits on your laptop and plays audio responses. Single binary, no dependencies. On M1 models that lack the SPU accelerometer, spank falls back to keyboard-triggered mode.
 
 ## Requirements
 
-- macOS on Apple Silicon (M2+)
-- `sudo` (for IOKit HID accelerometer access)
+- macOS on Apple Silicon (M2+ for accelerometer detection; M1 uses keyboard fallback)
+- `sudo` (for IOKit HID accelerometer access; not required for `--keyboard` or `--mic`)
+- Microphone mode (`--mic`) requires macOS mic permission and CGO-enabled builds
 - Go 1.26+ (if building from source)
 
 ## Install
@@ -69,6 +70,16 @@ sudo spank --cooldown 600
 sudo spank --speed 0.7   # slower and deeper
 sudo spank --speed 1.5   # faster
 sudo spank --sexy --speed 0.6
+
+# Keyboard mode — trigger a sound on any keypress (useful on M1)
+spank --keyboard
+
+# Mic mode — trigger a sound on sharp taps captured by the microphone (useful on M1)
+spank --mic
+
+# Mic tuning (higher = less sensitive)
+spank --mic --mic-threshold 0.03
+spank --mic --mic-multiplier 4.0
 ```
 
 ### Modes

@@ -15,6 +15,8 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"os/exec"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -30,6 +32,7 @@ import (
 	"github.com/taigrr/apple-silicon-accelerometer/detector"
 	"github.com/taigrr/apple-silicon-accelerometer/sensor"
 	"github.com/taigrr/apple-silicon-accelerometer/shm"
+	"golang.org/x/term"
 )
 
 var version = "dev"
@@ -49,13 +52,17 @@ var (
 	customPath   string
 	customFiles  []string
 	fastMode     bool
+	keyboardMode bool
+	micMode      bool
 	minAmplitude float64
 	cooldownMs   int
-	stdioMode      bool
-	volumeScaling  bool
-	paused         bool
-	pausedMu       sync.RWMutex
-	speedRatio     float64
+	stdioMode     bool
+	volumeScaling bool
+	paused        bool
+	pausedMu      sync.RWMutex
+	speedRatio    float64
+	micThreshold  float64
+	micMultiplier float64
 )
 
 // sensorReady is closed once shared memory is created and the sensor
@@ -95,6 +102,12 @@ const (
 
 	// sensorStartupDelay gives the sensor time to start producing data.
 	sensorStartupDelay = 100 * time.Millisecond
+
+	// defaultMicThreshold is the minimum RMS needed to trigger a hit in mic mode.
+	defaultMicThreshold = 0.02
+
+	// defaultMicMultiplier is the adaptive threshold multiplier for mic mode.
+	defaultMicMultiplier = 3.0
 )
 
 type runtimeTuning struct {
@@ -252,12 +265,16 @@ Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 	cmd.Flags().BoolVarP(&haloMode, "halo", "H", false, "Enable halo mode")
 	cmd.Flags().StringVarP(&customPath, "custom", "c", "", "Path to custom MP3 audio directory")
 	cmd.Flags().BoolVar(&fastMode, "fast", false, "Enable faster detection tuning (shorter cooldown, higher sensitivity)")
+	cmd.Flags().BoolVar(&keyboardMode, "keyboard", false, "Use keyboard input instead of the accelerometer (works on M1, disables stdio)")
+	cmd.Flags().BoolVar(&micMode, "mic", false, "Use microphone input instead of the accelerometer (requires mic permission)")
 	cmd.Flags().StringSliceVar(&customFiles, "custom-files", nil, "Comma-separated list of custom MP3 files")
 	cmd.Flags().Float64Var(&minAmplitude, "min-amplitude", defaultMinAmplitude, "Minimum amplitude threshold (0.0-1.0, lower = more sensitive)")
 	cmd.Flags().IntVar(&cooldownMs, "cooldown", defaultCooldownMs, "Cooldown between responses in milliseconds")
 	cmd.Flags().BoolVar(&stdioMode, "stdio", false, "Enable stdio mode: JSON output and stdin commands (for GUI integration)")
 	cmd.Flags().BoolVar(&volumeScaling, "volume-scaling", false, "Scale playback volume by slap amplitude (harder hits = louder)")
 	cmd.Flags().Float64Var(&speedRatio, "speed", defaultSpeedRatio, "Playback speed multiplier (0.5 = half speed, 2.0 = double speed)")
+	cmd.Flags().Float64Var(&micThreshold, "mic-threshold", defaultMicThreshold, "Mic mode RMS threshold (higher = less sensitive)")
+	cmd.Flags().Float64Var(&micMultiplier, "mic-multiplier", defaultMicMultiplier, "Mic mode adaptive threshold multiplier (higher = less sensitive)")
 
 	if err := fang.Execute(context.Background(), cmd); err != nil {
 		os.Exit(1)
@@ -265,8 +282,11 @@ Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 }
 
 func run(ctx context.Context, tuning runtimeTuning) error {
-	if os.Geteuid() != 0 {
-		return fmt.Errorf("spank requires root privileges for accelerometer access, run with: sudo spank")
+	if stdioMode && keyboardMode {
+		return fmt.Errorf("--stdio and --keyboard both read stdin; please choose one")
+	}
+	if micMode && keyboardMode {
+		return fmt.Errorf("--mic and --keyboard are mutually exclusive; pick one")
 	}
 
 	modeCount := 0
@@ -288,6 +308,25 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 	}
 	if tuning.cooldown <= 0 {
 		return fmt.Errorf("--cooldown must be greater than 0")
+	}
+	if micMode {
+		if micThreshold <= 0 {
+			return fmt.Errorf("--mic-threshold must be greater than 0")
+		}
+		if micMultiplier <= 0 {
+			return fmt.Errorf("--mic-multiplier must be greater than 0")
+		}
+	}
+
+	accelAvailable := false
+	if !keyboardMode && !micMode {
+		ok, err := hasAccelerometer()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "spank: warning: unable to detect accelerometer (%v); attempting accelerometer mode anyway\n", err)
+			accelAvailable = true
+		} else {
+			accelAvailable = ok
+		}
 	}
 
 	var pack *soundPack
@@ -323,6 +362,27 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	if micMode {
+		return listenForMicSlaps(ctx, pack, tuning, micConfig{
+			threshold:  micThreshold,
+			multiplier: micMultiplier,
+		})
+	}
+
+	if keyboardMode || !accelAvailable {
+		if !accelAvailable && stdioMode {
+			return fmt.Errorf("accelerometer not detected; --stdio requires accelerometer input (disable --stdio or use --keyboard without stdio)")
+		}
+		if !accelAvailable && !keyboardMode {
+			fmt.Fprintln(os.Stderr, "spank: AppleSPUHID accelerometer not detected; falling back to keyboard mode")
+		}
+		return listenForKeySlaps(ctx, pack, tuning)
+	}
+
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("spank requires root privileges for accelerometer access, run with: sudo spank")
+	}
+
 	// Create shared memory for accelerometer data.
 	accelRing, err := shm.CreateRing(shm.NameAccel)
 	if err != nil {
@@ -357,6 +417,20 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 	time.Sleep(sensorStartupDelay)
 
 	return listenForSlaps(ctx, pack, accelRing, tuning)
+}
+
+var accelUsageRegex = regexp.MustCompile(`(?m)"PrimaryUsage"\s*=\s*3`)
+
+func hasAccelerometer() (bool, error) {
+	cmd := exec.Command("ioreg", "-l", "-w0", "-c", "AppleSPUHIDDevice")
+	out, err := cmd.Output()
+	if err != nil {
+		return false, err
+	}
+	if len(out) == 0 {
+		return false, nil
+	}
+	return accelUsageRegex.Match(out), nil
 }
 
 func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuffer, tuning runtimeTuning) error {
@@ -452,6 +526,70 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 			fmt.Printf("slap #%d [%s amp=%.5fg] -> %s\n", num, ev.Severity, ev.Amplitude, file)
 		}
 		go playAudio(pack, file, ev.Amplitude, &speakerInit)
+	}
+}
+
+func listenForKeySlaps(ctx context.Context, pack *soundPack, tuning runtimeTuning) error {
+	tracker := newSlapTracker(pack, tuning.cooldown)
+	speakerInit := false
+	var lastYell time.Time
+
+	fd := int(os.Stdin.Fd())
+	oldState, err := term.MakeRaw(fd)
+	if err != nil {
+		return fmt.Errorf("entering keyboard mode: %w", err)
+	}
+	defer term.Restore(fd, oldState)
+
+	fmt.Printf("spank: keyboard mode enabled (press any key to trigger, ctrl+c to quit)\n")
+	if stdioMode {
+		fmt.Println(`{"status":"ready","mode":"keyboard"}`)
+	}
+
+	buf := make([]byte, 1)
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("\nbye!")
+			return nil
+		default:
+		}
+
+		n, err := os.Stdin.Read(buf)
+		if err != nil {
+			return fmt.Errorf("keyboard input failed: %w", err)
+		}
+		if n == 0 {
+			continue
+		}
+		if buf[0] == 3 { // ctrl+c
+			fmt.Println("\nbye!")
+			return nil
+		}
+
+		now := time.Now()
+		if time.Since(lastYell) <= tuning.cooldown {
+			continue
+		}
+
+		lastYell = now
+		num, score := tracker.record(now)
+		file := tracker.getFile(score)
+		if stdioMode {
+			event := map[string]interface{}{
+				"timestamp":  now.Format(time.RFC3339Nano),
+				"slapNumber": num,
+				"amplitude":  1.0,
+				"severity":   "keyboard",
+				"file":       file,
+			}
+			if data, err := json.Marshal(event); err == nil {
+				fmt.Println(string(data))
+			}
+		} else {
+			fmt.Printf("key #%d -> %s\n", num, file)
+		}
+		go playAudio(pack, file, 1.0, &speakerInit)
 	}
 }
 
